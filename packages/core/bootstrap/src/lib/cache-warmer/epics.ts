@@ -1,5 +1,4 @@
 import { AdapterRequest } from '@chainlink/types'
-import { omit } from 'lodash'
 import { AnyAction } from 'redux'
 import { combineEpics, createEpicMiddleware, Epic } from 'redux-observable'
 import { from, merge, of, partition, race, timer } from 'rxjs'
@@ -17,6 +16,7 @@ import {
 import { RootState } from '../..'
 import {
   warmupExecute,
+  WarmupExecutePayload,
   warmupFailed,
   warmupFulfilled,
   warmupJoinGroup,
@@ -24,10 +24,12 @@ import {
   warmupRequested,
   warmupStopped,
   warmupSubscribed,
+  WarmupSubscribedPayload,
   warmupSubscriptionTimeoutReset,
   warmupUnsubscribed,
 } from './actions'
 import { Config, get, WARMUP_REQUEST_ID } from './config'
+import { BatchWarmerSubscriptionKey, selectBatchWarmerSubscriptionKey } from './selectors'
 import { getSubscriptionKey } from './util'
 
 export interface EpicDependencies {
@@ -47,82 +49,29 @@ export const executeHandler: Epic<AnyAction, AnyAction, RootState, EpicDependenc
   const subscribeBatch$ = batchExecute$.pipe(
     withLatestFrom(state$),
     mergeMap(([{ payload }, state]) => {
-      const actionsToDispatch: AnyAction[] = []
+      const batchWarmerSubscriptionKey = selectBatchWarmerSubscriptionKey(state, payload)
+      const batchKey = payload.result?.debug?.batchKey
+      if (!batchKey) {
+        throw Error(`No batch key found, state invariant violated`)
+      }
 
-      const existingBatchWarmer = Object.entries(state.cacheWarmer.subscriptions).find(
-        ([, subscriptionState]) => {
-          const isBatchWarmerSubscription = subscriptionState.childLastSeenById
-          const isMatchingSubscription =
-            subscriptionState.executeFn.toString() === payload.executeFn.toString()
-          return isBatchWarmerSubscription && isMatchingSubscription
-        },
+      const childSubscriptions = createChildSubscriptionActions(
+        payload,
+        batchWarmerSubscriptionKey.key,
+        batchKey,
+      )
+      const childLastSeenById = Object.fromEntries(
+        childSubscriptions.map((c) => [getSubscriptionKey(c.payload), Date.now()] as const),
       )
 
-      // If there is no existing batch warmer,
-      // A new key is created by omitting the data field
-      // We want the key to be consistent. Otherwise it would change on every new child
-      const batchWarmerSubscriptionKey =
-        existingBatchWarmer?.[0] ?? getSubscriptionKey(omit(payload, ['data']))
-      const batchKey = payload.result?.debug?.batchKey
+      const parentSubscription = createParentSubscriptionAction(
+        batchKey,
+        batchWarmerSubscriptionKey,
+        childLastSeenById,
+        payload,
+      )
 
-      // Start placeholder subscriptions for children
-      const childLastSeenById: { [childKey: string]: number } = {}
-      // If result was from a batch request
-      if (payload.result?.data?.results) {
-        for (const [request] of Object.values<[AdapterRequest, number]>(
-          payload.result.data.results,
-        )) {
-          const warmupSubscribedPayloadChild = {
-            ...payload,
-            data: request,
-            parent: batchWarmerSubscriptionKey,
-            batchKey,
-          }
-          const childKey = getSubscriptionKey(warmupSubscribedPayloadChild)
-          childLastSeenById[childKey] = Date.now()
-          actionsToDispatch.push(warmupSubscribed(warmupSubscribedPayloadChild))
-        }
-      } else {
-        const warmupSubscribedPayloadChild = {
-          ...payload,
-          parent: batchWarmerSubscriptionKey,
-          batchKey,
-        }
-        const childKey = getSubscriptionKey(warmupSubscribedPayloadChild)
-        childLastSeenById[childKey] = Date.now()
-        actionsToDispatch.push(warmupSubscribed(warmupSubscribedPayloadChild))
-      }
-
-      // If batch warmer already exists join it by adding childLastSeenById to request data
-      if (existingBatchWarmer && batchKey) {
-        actionsToDispatch.push(
-          warmupJoinGroup({
-            parent: batchWarmerSubscriptionKey,
-            childLastSeenById: childLastSeenById,
-            batchKey,
-          }),
-        )
-      }
-      // If batch warmer does not exist, start it
-      else {
-        const warmupSubscribedAction =
-          batchKey && !Array.isArray(payload.data[batchKey])
-            ? // If incoming request isn't an array, transform into one
-              // So the request is used as a batch request
-              warmupSubscribed({
-                ...payload,
-                data: {
-                  ...payload.data,
-                  [batchKey]: [payload.data[batchKey]],
-                },
-                key: batchWarmerSubscriptionKey,
-                childLastSeenById,
-              })
-            : warmupSubscribed({ ...payload, key: batchWarmerSubscriptionKey, childLastSeenById })
-        actionsToDispatch.push(warmupSubscribedAction)
-      }
-
-      return from(actionsToDispatch)
+      return from([...childSubscriptions, parentSubscription])
     }),
   )
 
@@ -269,3 +218,69 @@ export const rootEpic = combineEpics(
 export const epicMiddleware = createEpicMiddleware<any, any, any, EpicDependencies>({
   dependencies: { config: get() },
 })
+
+function createChildSubscriptionActions(
+  payload: WarmupExecutePayload,
+  batchWarmerSubscriptionKey: string,
+  batchKey: string | undefined,
+): ReturnType<typeof warmupSubscribed>[] {
+  const subscriptionPayload: WarmupSubscribedPayload = {
+    ...payload,
+    parent: batchWarmerSubscriptionKey,
+    batchKey,
+  }
+
+  // If result was from a batch request
+  if (payload.result?.data?.results) {
+    return Object.values<[AdapterRequest, number]>(payload.result.data.results).map(([request]) =>
+      warmupSubscribed({
+        ...subscriptionPayload,
+        data: request,
+      }),
+    )
+  } else {
+    return [warmupSubscribed(subscriptionPayload)]
+  }
+}
+
+function createParentSubscriptionAction(
+  batchKey: string,
+  batchWarmerSubscriptionKey: BatchWarmerSubscriptionKey,
+  childLastSeenById: { [childKey: string]: number },
+  payload: WarmupExecutePayload,
+) {
+  const basePayload = {
+    childLastSeenById,
+    batchKey,
+  } as const
+
+  // If batch warmer already exists join it by adding childLastSeenById to request data
+  if (batchWarmerSubscriptionKey.existingKey) {
+    return warmupJoinGroup({
+      ...basePayload,
+      parent: batchWarmerSubscriptionKey.key,
+    })
+  }
+  // If batch warmer does not exist, start it
+  else {
+    const subscriptionPayload: WarmupSubscribedPayload = {
+      ...basePayload,
+      ...payload,
+      key: batchWarmerSubscriptionKey.key,
+    }
+
+    // If incoming request isn't an array, transform into one
+    // So the request is sed as a batch request
+    if (!Array.isArray(payload.data[batchKey])) {
+      return warmupSubscribed({
+        ...subscriptionPayload,
+        data: {
+          ...payload.data,
+          [batchKey]: [payload.data[batchKey]],
+        },
+      })
+    }
+
+    return warmupSubscribed(subscriptionPayload)
+  }
+}
