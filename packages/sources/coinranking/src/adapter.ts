@@ -9,7 +9,7 @@ const customParams = {
 }
 
 const referenceSymbolToUuid = async (symbol: string, config: Config): Promise<string> => {
-  const url = config.api.baseURL + '/reference-currencies'
+  const url = '/reference-currencies'
   const headers = {
     'x-access-token': util.getRandomRequiredEnv('API_KEY'),
   }
